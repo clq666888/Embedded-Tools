@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "name": "毕设设备状态帧",
+  "description": "根据 E:\\bishe\\software\\mycode\\Bluetooth.c 中 Bluetooth_SendDeviceStatus() 生成。帧格式：E2 80 天气 温度 湿度 光照低字节 光照高字节。",
+  "frame_length": 7,
+  "header_enabled": true,
+  "header_hex": "E2 80",
+  "parse_interval_seconds": 1,
+  "fields": [
+    {
+      "name": "天气状态（0=雨，1=晴）",
+      "length": 1,
+      "positions": [3],
+      "endian": "大端读取",
+      "base": "十进制",
+      "signed": false
+    },
+    {
+      "name": "温度（℃）",
+      "length": 1,
+      "positions": [4],
+      "endian": "大端读取",
+      "base": "十进制",
+      "signed": false
+    },
+    {
+      "name": "湿度（%）",
+      "length": 1,
+      "positions": [5],
+      "endian": "大端读取",
+      "base": "十进制",
+      "signed": false
+    },
+    {
+      "name": "光照强度",
+      "length": 2,
+      "positions": [6, 7],
+      "endian": "小端读取",
+      "base": "十进制",
+      "signed": false
+    }
+  ]
+}
