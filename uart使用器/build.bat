@@ -7,7 +7,7 @@ if errorlevel 1 goto failed
 if errorlevel 1 goto failed
 .venv\Scripts\python.exe make_icon.py
 if errorlevel 1 goto failed
-.venv\Scripts\python.exe -m PyInstaller --noconfirm --onefile --windowed --name "UART Tool" --icon "%~dp0assets\uart.ico" --workpath build-release --distpath dist-release --specpath build-release main.py
+.venv\Scripts\python.exe -m PyInstaller --noconfirm --distpath dist-release --workpath build-release "UART Tool.spec"
 if errorlevel 1 goto failed
 copy /y "dist-release\UART Tool.exe" "UART串口助手.exe" >nul
 if errorlevel 1 goto failed
