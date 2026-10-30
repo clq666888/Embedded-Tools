@@ -32,6 +32,9 @@ class App(tk.Tk):
         self.stop_reader = threading.Event()
         self.rx = bytearray()
         self.rx_chunks = []
+        self._view_chunk_count=0
+        self._view_chunk_lines=deque()
+        self._serial_update_after=None
         self.app_dir=Path(sys.executable).resolve().parent if getattr(sys,"frozen",False) else Path(__file__).resolve().parent
         self.build()
         self.refresh()
@@ -93,20 +96,31 @@ class App(tk.Tk):
         self.port_map={}
         self.ports=ttk.Combobox(c,textvariable=self.portname,width=25,state="readonly",postcommand=self.refresh)
         self.ports.grid(row=0,column=1,sticky="ew",padx=5)
+        self.ports.bind("<<ComboboxSelected>>",self._schedule_serial_reconfigure)
         self.conn=ttk.Button(c,text="连接",command=self.connect)
         self.conn.grid(row=0,column=2,padx=(0,10))
         ttk.Label(c,text="波特率").grid(row=0,column=3)
         self.baud=tk.StringVar(value="9600")
-        ttk.Combobox(c,textvariable=self.baud,values=("9600","19200","38400","57600","115200","230400","460800","921600"),width=10).grid(row=0,column=4,padx=5)
+        self.baud_box=ttk.Combobox(c,textvariable=self.baud,values=("9600","19200","38400","57600","115200","230400","460800","921600"),width=10)
+        self.baud_box.grid(row=0,column=4,padx=5)
+        self.baud_box.bind("<<ComboboxSelected>>",self._schedule_serial_reconfigure)
+        self.baud_box.bind("<Return>",self._schedule_serial_reconfigure)
+        self.baud_box.bind("<FocusOut>",self._schedule_serial_reconfigure)
         ttk.Label(c,text="数据位").grid(row=0,column=5)
         self.bits=tk.StringVar(value="8")
-        ttk.Combobox(c,textvariable=self.bits,values=("5","6","7","8"),width=4,state="readonly").grid(row=0,column=6,padx=5)
+        self.bits_box=ttk.Combobox(c,textvariable=self.bits,values=("5","6","7","8"),width=4,state="readonly")
+        self.bits_box.grid(row=0,column=6,padx=5)
+        self.bits_box.bind("<<ComboboxSelected>>",self._schedule_serial_reconfigure)
         ttk.Label(c,text="校验").grid(row=0,column=7)
         self.parity=tk.StringVar(value="None")
-        ttk.Combobox(c,textvariable=self.parity,values=("None","Even","Odd"),width=7,state="readonly").grid(row=0,column=8,padx=5)
+        self.parity_box=ttk.Combobox(c,textvariable=self.parity,values=("None","Even","Odd"),width=7,state="readonly")
+        self.parity_box.grid(row=0,column=8,padx=5)
+        self.parity_box.bind("<<ComboboxSelected>>",self._schedule_serial_reconfigure)
         ttk.Label(c,text="停止位").grid(row=0,column=9)
         self.stopbits=tk.StringVar(value="1")
-        ttk.Combobox(c,textvariable=self.stopbits,values=("1","1.5","2"),width=4,state="readonly").grid(row=0,column=10,padx=5)
+        self.stopbits_box=ttk.Combobox(c,textvariable=self.stopbits,values=("1","1.5","2"),width=4,state="readonly")
+        self.stopbits_box.grid(row=0,column=10,padx=5)
+        self.stopbits_box.bind("<<ComboboxSelected>>",self._schedule_serial_reconfigure)
         panes=ttk.Panedwindow(page,orient="vertical")
         panes.grid(row=1,column=0,sticky="nsew")
         self.serial_panes=panes
@@ -199,7 +213,7 @@ class App(tk.Tk):
 
     def _build_frame_send_editor(self,parent):
         parent.columnconfigure(0,weight=1)
-        parent.rowconfigure(1,weight=0)
+        parent.rowconfigure(1,weight=1)
         settings=ttk.Frame(parent)
         settings.grid(row=0,column=0,sticky="ew",pady=(0,4))
         ttk.Label(settings,text="数据帧长度").pack(side="left")
@@ -221,19 +235,110 @@ class App(tk.Tk):
             state="disabled")
         self.frame_send_add_button.pack(side="left",padx=(6,0))
 
-        self._frame_send_values_box=ttk.Frame(parent,padding=(5,1))
+        scroll_area=ttk.Frame(parent)
+        scroll_area.grid(row=1,column=0,sticky="nsew")
+        scroll_area.columnconfigure(0,weight=1); scroll_area.rowconfigure(0,weight=1)
+        self._frame_send_canvas=tk.Canvas(scroll_area,highlightthickness=0,borderwidth=0)
+        self._frame_send_canvas.grid(row=0,column=0,sticky="nsew")
+        self._frame_send_layout_after=None
+        self._frame_send_layout_signature=None
+        self._frame_send_layout_dirty=True
+        self._frame_send_scrollregion=None
+        self._frame_send_canvas_item_width=0
+        frame_send_scroll=ttk.Scrollbar(scroll_area,orient="vertical",command=self._frame_send_canvas.yview)
+        frame_send_scroll.grid(row=0,column=1,sticky="ns")
+        self._frame_send_canvas.configure(yscrollcommand=frame_send_scroll.set)
+        self._frame_send_content=ttk.Frame(self._frame_send_canvas)
+        self._frame_send_content.columnconfigure(0,weight=1)
+        self._frame_send_content_window=self._frame_send_canvas.create_window(
+            (0,0),window=self._frame_send_content,anchor="nw")
+        self._frame_send_content.bind("<Configure>",self._update_frame_send_scrollregion)
+        self._frame_send_canvas.bind("<Configure>",self._resize_frame_send_canvas)
+        self.bind_all("<MouseWheel>",self._frame_send_mousewheel,add="+")
+
+        self._frame_send_values_box=ttk.Frame(self._frame_send_content,padding=(5,1))
         self._frame_send_values_box.columnconfigure(0,weight=1)
         self._frame_send_inputs=ttk.Frame(self._frame_send_values_box)
         self._frame_send_inputs.grid(row=0,column=0,sticky="ew")
+        self._frame_send_decimal_cards=[]
 
-        self._frame_send_preview_box=ttk.Frame(parent)
+        self._frame_send_preview_box=ttk.Frame(self._frame_send_content,padding=(5,1))
         ttk.Label(self._frame_send_preview_box,text="HEX 发送数据").pack(anchor="w")
         self._frame_send_preview=ttk.Frame(self._frame_send_preview_box)
         self._frame_send_preview.pack(fill="x",expand=True)
+        self._frame_send_hex_cells=[]
         self._rebuild_frame_send_cells()
         self._toggle_frame_decimal()
         parent.grid(row=0,column=0,sticky="nsew")
         parent.grid_remove()
+
+    def _update_frame_send_scrollregion(self,_event=None):
+        if hasattr(self,"_frame_send_canvas"):
+            region=self._frame_send_canvas.bbox("all")
+            if region!=self._frame_send_scrollregion:
+                self._frame_send_canvas.configure(scrollregion=region)
+                self._frame_send_scrollregion=region
+
+    def _resize_frame_send_canvas(self,event):
+        if event.width!=self._frame_send_canvas_item_width:
+            self._frame_send_canvas.itemconfigure(self._frame_send_content_window,width=event.width)
+            self._frame_send_canvas_item_width=event.width
+        self._schedule_frame_send_layout()
+
+    def _schedule_frame_send_layout(self):
+        if not hasattr(self,"_frame_send_canvas"):return
+        if self._frame_send_layout_after is not None:
+            try:self.after_cancel(self._frame_send_layout_after)
+            except tk.TclError:pass
+        self._frame_send_layout_after=self.after(70,self._apply_frame_send_layout)
+
+    def _apply_frame_send_layout(self):
+        self._frame_send_layout_after=None
+        if not self._frame_send_canvas.winfo_exists():return
+        self._layout_frame_send_cells()
+        self._update_frame_send_scrollregion()
+
+    def _layout_frame_send_cells(self,available_width=None):
+        if not hasattr(self,"_frame_send_canvas"):return
+        if available_width is None:available_width=self._frame_send_canvas.winfo_width()
+        if available_width<=1:return
+        available_width=max(1,available_width-8)
+
+        cards=self._frame_send_decimal_cards
+        cells=self._frame_send_hex_cells
+        if self._frame_send_layout_dirty:
+            self._frame_send_card_width=max((card.winfo_reqwidth() for card in cards),default=0)
+            self._frame_send_hex_cell_width=max((cell.winfo_reqwidth() for cell in cells),default=0)+2
+            self._frame_send_layout_dirty=False
+        card_width=self._frame_send_card_width
+        card_columns=max(1,(available_width+10)//(card_width+10)) if cards and card_width else 1
+        hex_columns=max(1,min(len(cells),available_width//self._frame_send_hex_cell_width)) if cells and self._frame_send_hex_cell_width else 1
+        signature=(len(cards),card_columns,len(cells),hex_columns)
+        if signature==self._frame_send_layout_signature:return
+
+        if cards and (self._frame_send_layout_signature is None or signature[:2]!=self._frame_send_layout_signature[:2]):
+            for card in cards:card.grid_forget()
+            for column in range(card_columns):self._frame_send_inputs.columnconfigure(column,weight=0,uniform="decimalfields")
+            for index,card in enumerate(cards):
+                row,column=divmod(index,card_columns)
+                card.grid(row=row,column=column,sticky="w",padx=(2,8),pady=2)
+
+        if cells and (self._frame_send_layout_signature is None or signature[2:]!=self._frame_send_layout_signature[2:]):
+            for cell in cells:cell.grid_forget()
+            for column in range(hex_columns):self._frame_send_preview.columnconfigure(column,weight=1,uniform="framebytes")
+            for index,cell in enumerate(cells):
+                row,column=divmod(index,hex_columns)
+                cell.grid(row=row,column=column,sticky="ew")
+        self._frame_send_layout_signature=signature
+
+    def _frame_send_mousewheel(self,event):
+        if self.sendmode.get()!="数据帧" or not self.frame_send_panel.winfo_ismapped():return
+        canvas=self._frame_send_canvas
+        left,top=canvas.winfo_rootx(),canvas.winfo_rooty()
+        if not (left<=event.x_root<left+canvas.winfo_width() and top<=event.y_root<top+canvas.winfo_height()):return
+        if event.delta:
+            canvas.yview_scroll(-1 if event.delta>0 else 1,"units")
+            return "break"
 
     @staticmethod
     def _valid_decimal_byte(proposed):
@@ -264,13 +369,14 @@ class App(tk.Tk):
             field["positions"]=[p for p in field.get("positions",[]) if isinstance(p,int) and 1<=p<=size]
         for child in self._frame_send_inputs.winfo_children():child.destroy()
         for child in self._frame_send_preview.winfo_children():child.destroy()
+        self._frame_send_decimal_cards=[]; self._frame_send_hex_cells=[]
+        self._frame_send_layout_dirty=True
+        self._frame_send_layout_signature=None
         self._frame_send_hex_vars=[]; self._frame_send_hex_entries=[]
         validate_decimal=(self.register(self._valid_decimal_byte),"%P")
-        for column in range(5):self._frame_send_inputs.columnconfigure(column,weight=0,uniform="decimalfields")
         for index,field in enumerate(self._frame_send_fields):
-            row,column=divmod(index,5)
             card=tk.Frame(self._frame_send_inputs,background="#D8E0E8",padx=1,pady=1)
-            card.grid(row=row,column=column,sticky="w",padx=(2,8),pady=2)
+            self._frame_send_decimal_cards.append(card)
             cell=ttk.Frame(card,padding=(5,3))
             cell.pack()
             value_var=tk.StringVar(value=field["value"])
@@ -279,8 +385,14 @@ class App(tk.Tk):
                       validatecommand=validate_decimal).grid(row=0,column=1,sticky="w",padx=(0,5),pady=1)
             ttk.Label(cell,text="目标位").grid(row=0,column=2,sticky="w",padx=(0,2),pady=1)
             target_label=tk.StringVar(value=self._target_positions_text(field["positions"]))
-            target_box=ttk.Menubutton(cell,textvariable=target_label,direction="below",width=8)
+            target_box=tk.Menubutton(cell,textvariable=target_label,direction="below",width=8,
+                font=("Microsoft YaHei UI",9),bg="#EAF3FB",fg="#245B7A",
+                activebackground="#D8EAF7",activeforeground="#174968",
+                relief="raised",bd=1,indicatoron=True,anchor="w",padx=5,
+                cursor="hand2",highlightthickness=0)
             target_box.grid(row=0,column=3,sticky="w",padx=(0,4),pady=1)
+            target_box.bind("<Enter>",lambda event,f=field:self._schedule_target_tooltip(event,f))
+            target_box.bind("<Leave>",self._hide_target_tooltip)
             ttk.Button(cell,text="×",width=2,command=lambda i=index:self._remove_frame_send_field(i)).grid(row=0,column=4,pady=1)
             field["value_var"]=value_var; field["target_label_var"]=target_label; field["target_box"]=target_box
             field["position_vars"]={}
@@ -289,15 +401,15 @@ class App(tk.Tk):
 
         validate_hex=(self.register(self._valid_hex_byte),"%P")
         for index in range(size):
-            row,column=divmod(index,20)
-            self._frame_send_preview.columnconfigure(column,weight=1,uniform="framebytes")
-            cell=ttk.Frame(self._frame_send_preview,padding=(1,1)); cell.grid(row=row,column=column,sticky="ew")
+            cell=ttk.Frame(self._frame_send_preview,padding=(1,1))
+            self._frame_send_hex_cells.append(cell)
             hex_var=tk.StringVar(value=self._frame_send_manual_values[index])
             hex_var.trace_add("write",lambda *_args,i=index:self._on_frame_manual_hex_edited(i))
             hex_entry=tk.Entry(cell,textvariable=hex_var,width=4,justify="center",validate="key",
                 validatecommand=validate_hex,bg="#FFFFFF",disabledbackground="#E2E5E9",disabledforeground="#6B7280")
             hex_entry.pack(); hex_entry.bind("<FocusOut>",lambda _event,i=index:self._normalize_manual_hex(i))
             self._frame_send_hex_vars.append(hex_var); self._frame_send_hex_entries.append(hex_entry)
+        self._schedule_frame_send_layout()
         self._update_frame_send_preview()
 
     def _sync_frame_send_fields(self):
@@ -309,7 +421,35 @@ class App(tk.Tk):
 
     @staticmethod
     def _target_positions_text(positions):
-        return ", ".join(str(p) for p in sorted(positions)) if positions else "选择字节位"
+        return f"已选 {len(positions)} 位" if positions else "选择字节位"
+
+    def _schedule_target_tooltip(self,event,field):
+        self._hide_target_tooltip()
+        detail=("当前选择："+"、".join(f"第 {p} 位" for p in sorted(field.get("positions",[])))) if field.get("positions") else "当前未选择目标位"
+        self._target_tooltip_after=self.after(450,lambda:self._show_target_tooltip(event,detail))
+
+    def _show_target_tooltip(self,event,detail):
+        self._target_tooltip_after=None
+        tip=tk.Toplevel(self)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost",True)
+        tk.Label(tip,text=detail,bg="#263746",fg="#FFFFFF",
+            font=("Microsoft YaHei UI",9),padx=8,pady=5).pack()
+        tip.geometry(f"+{event.x_root+12}+{event.y_root+18}")
+        self._target_tooltip_window=tip
+
+    def _hide_target_tooltip(self,_event=None):
+        after_id=getattr(self,"_target_tooltip_after",None)
+        if after_id is not None:
+            try:self.after_cancel(after_id)
+            except tk.TclError:pass
+            self._target_tooltip_after=None
+        tip=getattr(self,"_target_tooltip_window",None)
+        if tip is not None:
+            try:
+                if tip.winfo_exists():tip.destroy()
+            except tk.TclError:pass
+            self._target_tooltip_window=None
 
     def _render_frame_send_selector(self,index):
         if index>=len(self._frame_send_fields):return
@@ -322,7 +462,7 @@ class App(tk.Tk):
         selected=set(field.get("positions",[]))
         for position in range(1,size+1):
             var=tk.BooleanVar(value=position in selected)
-            menu.add_checkbutton(label=f"{position} 位",variable=var,
+            menu.add_checkbutton(label=f"第 {position} 位",variable=var,
                 state="disabled" if position in used else "normal",
                 command=lambda i=index:self._on_frame_send_position_changed(i))
             field["position_vars"][position]=var
@@ -455,15 +595,11 @@ class App(tk.Tk):
         enabled=self.frame_send_decimal_enabled.get()
         self.frame_send_add_button.configure(state="normal" if enabled else "disabled")
         if enabled:
-            self._frame_send_values_box.grid(row=1,column=0,sticky="nsew",pady=(0,4))
-            self._frame_send_preview_box.grid(row=2,column=0,sticky="ew")
-            self.frame_send_panel.rowconfigure(1,weight=0,minsize=0)
-            self.frame_send_panel.rowconfigure(2,weight=0)
+            self._frame_send_values_box.grid(row=0,column=0,sticky="ew",pady=(0,4))
+            self._frame_send_preview_box.grid(row=1,column=0,sticky="ew")
         else:
             self._frame_send_values_box.grid_remove()
-            self._frame_send_preview_box.grid(row=1,column=0,sticky="ew")
-            self.frame_send_panel.rowconfigure(1,weight=0,minsize=0)
-            self.frame_send_panel.rowconfigure(2,weight=0,minsize=0)
+            self._frame_send_preview_box.grid(row=0,column=0,sticky="ew")
         self._update_frame_send_preview()
 
     def _set_send_mode(self):
@@ -495,7 +631,7 @@ class App(tk.Tk):
             self.receive_views.add(self.hex_view,weight=1)
         if self.show_text.get():
             self.receive_views.add(self.text_view,weight=1)
-        self.refresh_view()
+        self.refresh_view(full=True)
 
     def build_parse_page(self, page):
         page.columnconfigure(0,weight=1)
@@ -1454,6 +1590,69 @@ class App(tk.Tk):
                 self.tk.call("ttk::combobox::PlacePopdown",self.ports._w,popdown)
         except tk.TclError:
             pass
+
+    def _serial_parameters(self):
+        parity={"None":serial.PARITY_NONE,"Even":serial.PARITY_EVEN,"Odd":serial.PARITY_ODD}[self.parity.get()]
+        stopbits={"1":serial.STOPBITS_ONE,"1.5":serial.STOPBITS_ONE_POINT_FIVE,"2":serial.STOPBITS_TWO}[self.stopbits.get()]
+        baudrate=int(self.baud.get())
+        if baudrate<=0:raise ValueError("波特率必须大于 0。")
+        return {"baudrate":baudrate,"bytesize":int(self.bits.get()),"parity":parity,
+                "stopbits":stopbits,"timeout":.1,"write_timeout":1}
+
+    def _schedule_serial_reconfigure(self,_event=None):
+        if not self.port or not getattr(self.port,"is_open",False):return
+        if self._serial_update_after is not None:
+            try:self.after_cancel(self._serial_update_after)
+            except tk.TclError:pass
+        self._serial_update_after=self.after(180,self._apply_serial_reconfigure)
+
+    def _restore_serial_controls(self):
+        if not self.port:return
+        self.baud.set(str(self.port.baudrate))
+        self.bits.set(str(self.port.bytesize))
+        self.parity.set({serial.PARITY_NONE:"None",serial.PARITY_EVEN:"Even",serial.PARITY_ODD:"Odd"}.get(self.port.parity,"None"))
+        self.stopbits.set({1.0:"1",1.5:"1.5",2.0:"2"}.get(float(self.port.stopbits),str(self.port.stopbits)))
+        current_label=next((label for label,device in self.port_map.items() if device==self.port.name),None)
+        if current_label:self.portname.set(current_label)
+
+    def _apply_serial_reconfigure(self):
+        self._serial_update_after=None
+        if not self.port or not getattr(self.port,"is_open",False):return
+        try:
+            selected_port=self.port_map.get(self.portname.get())
+            if not selected_port:raise ValueError("请选择仍然存在的串口设备。")
+            parameters=self._serial_parameters()
+            if selected_port==self.port.name:
+                old=(self.port.baudrate,self.port.bytesize,self.port.parity,self.port.stopbits)
+                try:
+                    self.port.baudrate=parameters["baudrate"]
+                    self.port.bytesize=parameters["bytesize"]
+                    self.port.parity=parameters["parity"]
+                    self.port.stopbits=parameters["stopbits"]
+                except Exception:
+                    self.port.baudrate,self.port.bytesize,self.port.parity,self.port.stopbits=old
+                    raise
+            else:
+                new_port=serial.Serial(selected_port,**parameters)
+                old_port=self.port
+                old_reader=self.reader_thread
+                self.stop_reader.set()
+                try:old_port.close()
+                except Exception:pass
+                if old_reader and old_reader.is_alive():old_reader.join(timeout=1.0)
+                self.port=new_port
+                self.stop_reader.clear()
+                self.reader_thread=threading.Thread(target=self.reader,args=(new_port,),daemon=True)
+                self.reader_thread.start()
+            self._mark_wave_gap()
+            if hasattr(self,"_parse_pending"):
+                self._parse_pending.clear()
+                self._parse_offset=len(self.rx)
+            self.status.set(f"已连接 {self.port.name} @ {parameters['baudrate']} · RX {len(self.rx)} 字节")
+        except Exception as error:
+            self._restore_serial_controls()
+            messagebox.showerror("串口参数更新失败",str(error),parent=self)
+
     def connect(self):
         if self.port:
             self._stop_repeat_send()
@@ -1473,9 +1672,7 @@ class App(tk.Tk):
             messagebox.showwarning("请选择串口","请刷新并选择一个串口设备。")
             return
         try:
-            parity={"None":serial.PARITY_NONE,"Even":serial.PARITY_EVEN,"Odd":serial.PARITY_ODD}[self.parity.get()]
-            sb={"1":serial.STOPBITS_ONE,"1.5":serial.STOPBITS_ONE_POINT_FIVE,"2":serial.STOPBITS_TWO}[self.stopbits.get()]
-            self.port=serial.Serial(port_name,int(self.baud.get()),int(self.bits.get()),parity,sb,timeout=.1,write_timeout=1)
+            self.port=serial.Serial(port_name,**self._serial_parameters())
         except Exception as e:
             self.port=None
             messagebox.showerror("连接失败",str(e))
@@ -1521,8 +1718,7 @@ class App(tk.Tk):
                 changed=True
         if batch:
             stamp=datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            self.rx_chunks.append((stamp,bytes(batch),"rx"))
-            if len(self.rx_chunks)>5000: del self.rx_chunks[:-5000]
+            self._store_log_chunk(stamp,bytes(batch),"rx")
         if changed:
             self.refresh_view()
             if self.port:
@@ -1532,18 +1728,51 @@ class App(tk.Tk):
             self.status.set("接收线程已停止；请断开后重新连接")
         self.after(50,self.poll)
 
-    def refresh_view(self):
+    def _store_log_chunk(self,stamp,data,direction):
+        self.rx_chunks.append((stamp,data,direction))
+        if len(self.rx_chunks)>5000:
+            remove_count=len(self.rx_chunks)-4500
+            del self.rx_chunks[:remove_count]
+            self._trim_visible_log(remove_count)
+
+    def _trim_visible_log(self,count):
+        if count<=0:return
+        if count>self._view_chunk_count or count>len(self._view_chunk_lines):
+            self.refresh_view(full=True)
+            return
+        old_lines=[self._view_chunk_lines.popleft() for _ in range(count)]
+        self._view_chunk_count-=count
+        self.out_hex.configure(state="normal")
+        self.out_text.configure(state="normal")
+        self.out_hex.delete("1.0",f"{sum(pair[0] for pair in old_lines)+1}.0")
+        self.out_text.delete("1.0",f"{sum(pair[1] for pair in old_lines)+1}.0")
+        self.out_hex.configure(state="disabled")
+        self.out_text.configure(state="disabled")
+
+    def refresh_view(self,full=False):
         for widget in (self.out_hex,self.out_text):
             widget.configure(state="normal")
-            widget.delete("1.0","end")
-        for entry in self.rx_chunks:
+        if full:
+            for widget in (self.out_hex,self.out_text):
+                widget.delete("1.0","end")
+            self._view_chunk_count=0
+            self._view_chunk_lines.clear()
+        start=self._view_chunk_count
+        for entry in self.rx_chunks[start:]:
             stamp,data,direction=entry if len(entry)==3 else (*entry,"rx")
             hex_payload=" ".join(f"{b:02X}" for b in data)
-            text_payload=data.decode("utf-8",errors="replace").replace("\r","\\r").replace("\n","\\n")
+            # In text mode, UART line terminators should behave like terminal
+            # line breaks instead of being rendered as the literal characters \\r/\\n.
+            text_payload=data.decode("utf-8",errors="replace").replace("\r\n","\n").replace("\r","\n")
             label="发送→" if direction=="tx" else "接收←"
             tags=("tx",) if direction=="tx" else ()
             self.out_hex.insert("end",f"[{stamp}] {label} {hex_payload}\n",tags)
-            self.out_text.insert("end",f"[{stamp}] {label} {text_payload}\n",tags)
+            text_line=f"[{stamp}] {label} {text_payload}"
+            if not text_payload.endswith("\n"):
+                text_line+="\n"
+            self.out_text.insert("end",text_line,tags)
+            self._view_chunk_lines.append((1,max(1,text_line.count("\n"))))
+            self._view_chunk_count+=1
         for widget in (self.out_hex,self.out_text):
             widget.configure(state="disabled")
         self.out_hex.see("end")
@@ -1555,7 +1784,7 @@ class App(tk.Tk):
         if hasattr(self,"_parse_pending"):
             self._parse_pending.clear()
             self._parse_offset=0
-        self.refresh_view()
+        self.refresh_view(full=True)
         self.settext(self.parsed,"接收缓冲已清空。")
 
     def send(self):
@@ -1575,8 +1804,7 @@ class App(tk.Tk):
             if data:
                 self.port.write(data)
                 stamp=datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                self.rx_chunks.append((stamp,data,"tx"))
-                if len(self.rx_chunks)>5000: del self.rx_chunks[:-5000]
+                self._store_log_chunk(stamp,data,"tx")
                 self.refresh_view()
                 self.status.set(f"已发送 {len(data)} 字节 · RX {len(self.rx)} 字节")
                 return True
@@ -1639,6 +1867,12 @@ class App(tk.Tk):
 
     def close(self):
         self._stop_repeat_send()
+        if getattr(self,"_frame_send_layout_after",None) is not None:
+            try:self.after_cancel(self._frame_send_layout_after)
+            except tk.TclError:pass
+        if self._serial_update_after is not None:
+            try:self.after_cancel(self._serial_update_after)
+            except tk.TclError:pass
         if getattr(self,"_port_refresh_after",None) is not None:
             try:self.after_cancel(self._port_refresh_after)
             except tk.TclError:pass
