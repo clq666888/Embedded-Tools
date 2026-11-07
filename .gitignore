@@ -1,4 +1,5 @@
 # Python virtual environments and caches
+/AGENTS.md
 **/.venv/
 **/venv/
 **/__pycache__/
